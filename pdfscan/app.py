@@ -1,288 +1,175 @@
-from flask import Flask, request, redirect, url_for, render_template, flash, render_template_string
 import os
+import time
+import requests
+from flask import Flask, request, render_template, redirect, url_for
 from werkzeug.utils import secure_filename
-import PyPDF2
 from pymongo import MongoClient
-import pdfplumber
-import re
+from datetime import datetime
 
-UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'pdf'}
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
 
 MONGO_URI = 'mongodb+srv://myrealnameisabdullah:3NpMi44K9CSEANN8@cluster0.dwj1mqk.mongodb.net/'
 DB_NAME = 'pdfscan_db'
 COLLECTION_NAME = 'pdfs'
 
-app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.secret_key = 'supersecretkey'
-
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
-pdfs_collection = db[COLLECTION_NAME]
+collection = db[COLLECTION_NAME]
 
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+API_KEY = 'LTEyNDc2NzUxMjY=_3b7441rtz5a80k5c2lblo'
+API_URL_BASE = "https://api.extracta.ai/api/v1"
 
-@app.route('/')
-def index():
-    return 'PDFScan Flask App is running!'
+def create_extraction():
+    url = f"{API_URL_BASE}/createExtraction"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+    extraction_details = {
+        "extractionDetails": {
+            "name": "Invoice Data Extraction",
+            "description": "Extract fields from invoice PDFs",
+            "language": "English",
+            "options": {
+                "hasTable": True,
+                "handwrittenTextRecognition": False,
+                "checkboxRecognition": False
+            },
+            "fields": [
+                { "key": "invoice_number", "example": "1" },
+                { "key": "seller", "example": "Me" },
+                { "key": "bill_to", "example": "Human" },
+                { "key": "ship_to", "example": "Abdu DHabi" },
+                { "key": "invoice_date", "example": "Jul 16, 2025" },
+                { "key": "payment_terms", "example": "Card" },
+                { "key": "due_date", "example": "Jul 23, 2025" },
+                { "key": "po_number", "example": "3033" },
+                { "key": "item_1_description", "example": "Item 1" },
+                { "key": "item_1_quantity", "example": "123" },
+                { "key": "item_1_rate", "example": "AED 334.00" },
+                { "key": "item_1_amount", "example": "AED 41,082.00" },
+                { "key": "subtotal", "example": "AED 41,082.00" },
+                { "key": "discount", "example": "AED 18,486.90" },
+                { "key": "tax", "example": "AED 1,129.76" },
+                { "key": "shipping", "example": "AED 34.00" },
+                { "key": "total", "example": "AED 23,758.86" },
+                { "key": "amount_paid", "example": "AED 20,000.00" },
+                { "key": "balance_due", "example": "AED 3,758.86" },
+                { "key": "notes", "example": "New" },
+                { "key": "terms", "example": "New items" }
+            ]
+        }
+    }
+    response = requests.post(url, json=extraction_details, headers=headers)
+    response.raise_for_status()
+    return response.json().get("extractionId")
 
-@app.route('/upload', methods=['GET', 'POST'])
-def upload_file():
-    if request.method == 'POST':
-        if 'file' not in request.files:
-            flash('No file part')
-            return redirect(request.url)
-        file = request.files['file']
+def upload_file_to_extraction(extraction_id, filepath):
+    url = f"{API_URL_BASE}/uploadFiles"
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+    with open(filepath, "rb") as f:
+        files = {"files": (os.path.basename(filepath), f, "application/octet-stream")}
+        data = {"extractionId": extraction_id}
+        response = requests.post(url, headers=headers, files=files, data=data)
+        response.raise_for_status()
+        return response.json()
+
+def get_batch_results(extraction_id, batch_id):
+    url = f"{API_URL_BASE}/getBatchResults"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+    payload = {"extractionId": extraction_id, "batchId": batch_id}
+    time.sleep(2)
+    response = requests.post(url, json=payload, headers=headers)
+    response.raise_for_status()
+    return response.json()
+
+@app.route("/", methods=["GET", "POST"])
+def upload_invoice():
+    if request.method == "POST":
+        if 'invoice' not in request.files:
+            return "No file uploaded"
+        file = request.files['invoice']
         if file.filename == '':
-            flash('No selected file')
-            return redirect(request.url)
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(filepath)
+            return "No file selected"
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
 
-            # PDF parsing with pdfplumber
-            with pdfplumber.open(filepath) as pdf:
-                text = ""
-                for page in pdf.pages:
-                    text += page.extract_text() or ""
+        try:
+            extraction_id = create_extraction()
+            upload_result = upload_file_to_extraction(extraction_id, filepath)
+            batch_id = upload_result.get("batchId")
 
-            # Clean and split lines
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            result = get_batch_results(extraction_id, batch_id)
+            files = result.get("files", [])
+            if not files:
+                # Save basic info so we can retry later
+                document = {
+                    "filename": filename,
+                    "filepath": filepath,
+                    "extractionId": extraction_id,
+                    "batchId": batch_id,
+                    "status": "processing",
+                    "uploadedAt": datetime.utcnow()
+                }
+                collection.insert_one(document)
+                return redirect(url_for('retry_result', extraction_id=extraction_id, batch_id=batch_id))
 
-            # Helper functions
-            def get_value_regex(pattern, lines):
-                for line in lines:
-                    m = re.search(pattern, line)
-                    if m:
-                        return m.group(1).strip()
-                return None
 
-            def get_value_right_of_label(label, lines):
-                for line in lines:
-                    if label in line:
-                        parts = line.split(label, 1)
-                        if len(parts) == 2 and parts[1].strip():
-                            return parts[1].strip()
-                return None
+            structured_data = files[0].get("result", {})
 
-            def get_summary_value(label, lines):
-                for line in lines:
-                    if label in line:
-                        idx = line.rfind(':')
-                        if idx != -1:
-                            value = line[idx+1:].strip()
-                            if value:
-                                return value
-                return None
+            # Transform flat item_1_* keys into items array
+            item_pattern = re.compile(r'item_(\d+)_(\w+)')
+            items_dict = {}
+            keys_to_delete = []
 
-            def get_next_line_after_label(label, lines):
-                for i, line in enumerate(lines):
-                    if line.strip() == label and i+1 < len(lines):
-                        next_line = lines[i+1].strip()
-                        if next_line:
-                            return next_line
-                return None
+            for key, value in structured_data.items():
+                match = item_pattern.match(key)
+                if match:
+                    idx, field = match.groups()
+                    idx = int(idx)
+                    items_dict.setdefault(idx, {})[field] = value
+                    keys_to_delete.append(key)
 
-            # Debug output
-            print('--- PDF Lines ---')
-            for idx, l in enumerate(lines):
-                print(f'{idx}: {l}')
-            print('-----------------')
+            for key in keys_to_delete:
+                del structured_data[key]
 
-            # 'From' extraction
-            from_field = None
-            if lines:
-                first_line = lines[0]
-                if 'INVOICE' in first_line:
-                    from_field = first_line.split('INVOICE')[0].strip()
-                else:
-                    from_field = first_line.strip()
+            if items_dict:
+                structured_data["items"] = [items_dict[k] for k in sorted(items_dict.keys())]
 
-            # Invoice Number extraction (fixed)
-            invoice_number = get_value_regex(r'#\s*(\d+)', lines)
-            if not invoice_number:
-                for line in lines:
-                    m = re.search(r'#\s*(\d+)', line)
-                    if m:
-                        invoice_number = m.group(1)
-                        print(f'Invoice number fallback found: {invoice_number}')
-                        break
-
-            # Date and other fields
-            date = get_value_right_of_label('Date:', lines)
-            payment_terms = get_value_right_of_label('Payment Terms:', lines)
-            due_date = get_value_right_of_label('Due Date:', lines)
-            po_number = get_value_right_of_label('PO Number:', lines)
-            balance_due = get_value_right_of_label('Balance Due:', lines)
-
-            # Bill To and Ship To (fixed)
-            bill_to = None
-            ship_to = None
-            for i, line in enumerate(lines):
-                if 'Bill To:' in line and 'Ship To:' in line:
-                    if i + 2 < len(lines):
-                        candidate_line = lines[i + 2].strip()
-                        print(f'Bill/Ship To candidate line: {candidate_line}')
-                        words = candidate_line.split()
-                        if len(words) >= 2:
-                            bill_to = words[0]
-                            ship_to = ' '.join(words[1:])
-                    break
-
-            # Items
-            items = []
-            try:
-                item_start = next(i for i, l in enumerate(lines) if l.startswith('Item'))
-                for j in range(item_start+1, len(lines)):
-                    if lines[j].startswith('Subtotal:'):
-                        break
-                    m = re.match(r'(.+?)\s+(\d+)\s+([A-Z]{3} [\d,\.]+)\s+([A-Z]{3} [\d,\.]+)', lines[j])
-                    if m:
-                        items.append({
-                            'item': m.group(1),
-                            'quantity': m.group(2),
-                            'rate': m.group(3),
-                            'amount': m.group(4)
-                        })
-            except StopIteration:
-                pass
-
-            # Summary
-            subtotal = get_summary_value('Subtotal', lines)
-            discount = get_summary_value('Discount', lines)
-            tax = get_summary_value('Tax', lines)
-            shipping = get_summary_value('Shipping', lines)
-            total = get_summary_value('Total', lines)
-            amount_paid = get_summary_value('Amount Paid', lines)
-
-            # Notes and Terms
-            notes = get_next_line_after_label('Notes:', lines)
-            terms = get_next_line_after_label('Terms:', lines)
-
-            # Final invoice dict
-            invoice_data = {
-                'from': from_field,
-                'bill_to': bill_to,
-                'ship_to': ship_to,
-                'invoice_number': invoice_number,
-                'date': date,
-                'payment_terms': payment_terms,
-                'due_date': due_date,
-                'po_number': po_number,
-                'balance_due': balance_due,
-                'items': items,
-                'subtotal': subtotal,
-                'discount': discount,
-                'tax': tax,
-                'shipping': shipping,
-                'total': total,
-                'amount_paid': amount_paid,
-                'notes': notes,
-                'terms': terms
+            document = {
+                "filename": filename,
+                "filepath": filepath,
+                "extractionId": extraction_id,
+                "batchId": batch_id,
+                "upload_result": upload_result,
+                "extracted_data": structured_data,
+                "uploadedAt": datetime.utcnow()
             }
+            collection.insert_one(document)
+            return f"✅ File processed and saved.<br><pre>{structured_data}</pre>"
 
-            # Store in MongoDB
-            pdf_doc = {
-                'filename': filename,
-                'text_length': len(text),
-                'num_pages': len(pdf.pages),
-                'raw_lines': lines
-            }
-            pdf_doc.update(invoice_data)
-            pdfs_collection.insert_one(pdf_doc)
+        except Exception as e:
+            return f"❌ Error: {e}"
 
-            # Delete uploaded file
-            if os.path.exists(filepath):
-                os.remove(filepath)
+    return render_template("upload.html")
 
-            flash(f"File uploaded and invoice data extracted!")
-            return redirect(url_for('upload_file'))
-    return render_template_string('''
-    <!doctype html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>Upload PDF</title>
-        <style>
-            body { font-family: Arial, sans-serif; background: #f4f4f9; margin: 0; padding: 0; }
-            .container { max-width: 400px; margin: 60px auto; background: #fff; padding: 30px 40px 40px 40px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-            h1 { text-align: center; color: #333; }
-            form { display: flex; flex-direction: column; gap: 15px; }
-            input[type=file] { padding: 8px; }
-            input[type=submit] { background: #4f8cff; color: #fff; border: none; padding: 10px; border-radius: 5px; cursor: pointer; font-size: 16px; }
-            input[type=submit]:hover { background: #2563eb; }
-            .msg { color: #2563eb; text-align: center; margin-bottom: 10px; }
-            .nav { text-align: center; margin-top: 20px; }
-            .nav a { color: #4f8cff; text-decoration: none; margin: 0 10px; }
-            .nav a:hover { text-decoration: underline; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Upload PDF File</h1>
-            {% with messages = get_flashed_messages() %}
-              {% if messages %}
-                <div class="msg">{{ messages[0] }}</div>
-              {% endif %}
-            {% endwith %}
-            <form method="post" enctype="multipart/form-data">
-                <input type="file" name="file" required>
-                <input type="submit" value="Upload">
-            </form>
-            <div class="nav">
-                <a href="/pdfs">View Stored PDFs</a>
-            </div>
-        </div>
-    </body>
-    </html>
-    ''')
+@app.route("/retry/<extraction_id>/<batch_id>")
+def retry_result(extraction_id, batch_id):
+    try:
+        result = get_batch_results(extraction_id, batch_id)
+        files = result.get("files", [])
+        if not files:
+            return "🕒 Still processing. Try again shortly."
+        structured_data = files[0].get("result", {})
 
-@app.route('/pdfs')
-def list_pdfs():
-    pdfs = list(pdfs_collection.find())
-    html = '''
-    <!doctype html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <title>Stored PDFs</title>
-        <style>
-            body { font-family: Arial, sans-serif; background: #f4f4f9; margin: 0; padding: 0; }
-            .container { max-width: 800px; margin: 60px auto; background: #fff; padding: 30px 40px 40px 40px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-            h1 { text-align: center; color: #333; }
-            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-            th, td { padding: 12px 8px; border-bottom: 1px solid #e0e0e0; text-align: left; }
-            th { background: #4f8cff; color: #fff; }
-            tr:hover { background: #f1f7ff; }
-            .nav { text-align: center; margin-top: 20px; }
-            .nav a { color: #4f8cff; text-decoration: none; margin: 0 10px; }
-            .nav a:hover { text-decoration: underline; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Stored PDFs</h1>
-            <table>
-                <tr><th>Filename</th><th>Pages</th><th>Text Length</th></tr>'''
-    for pdf in pdfs:
-        html += f"<tr><td>{pdf.get('filename')}</td><td>{pdf.get('num_pages')}</td><td>{pdf.get('text_length')}</td></tr>"
-    html += '''
-            </table>
-            <div class="nav">
-                <a href="/upload">Upload another PDF</a>
-            </div>
-        </div>
-    </body>
-    </html>
-    '''
-    return html
+        collection.update_one(
+            {"extractionId": extraction_id},
+            {"$set": {"extracted_data": structured_data, "status": "complete"}}
+        )
 
-if __name__ == '__main__':
+        return f"✅ Data extraction complete.<br><pre>{structured_data}</pre>"
+    except Exception as e:
+        return f"❌ Retry failed: {e}"
+
+if __name__ == "__main__":
+    os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
     app.run(debug=True)
